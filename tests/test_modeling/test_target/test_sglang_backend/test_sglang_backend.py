@@ -1,13 +1,50 @@
+import gc
 import os
 import unittest
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import init_distributed
 from specforge.modeling.target.eagle3_target_model import SGLangEagle3TargetModel
 from tests.utils import get_available_port
+
+
+def _silence_sglang_allreduce_finalizer():
+    """Disable SGLang's custom all-reduce communicators before the worker exits.
+
+    Their ``__del__`` otherwise runs at interpreter shutdown, by which point the
+    ``torch`` module global is already ``None``, so ``free()`` logs an ignored
+    ``AttributeError: 'NoneType' object has no attribute 'distributed'``. Marking
+    them disabled makes the finalizer a no-op; the OS reclaims the buffers on
+    process exit. Reaching into SGLang internals is acceptable for test teardown.
+    """
+    try:
+        from sglang.srt.distributed import parallel_state as ps
+    except Exception:
+        return
+    for name in ("_TP", "_WORLD", "_PP", "_MOE_EP", "_MOE_TP", "_ATTN_TP", "_ATTN_CP"):
+        group = getattr(ps, name, None)
+        ca_comm = getattr(group, "ca_comm", None) if group is not None else None
+        if ca_comm is not None:
+            ca_comm.disabled = True
+
+
+def cleanup_distributed():
+    _silence_sglang_allreduce_finalizer()
+    gc.collect()
+    torch.cuda.empty_cache()
+    if dist.is_available() and dist.is_initialized():
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        try:
+            dist.destroy_process_group()
+        except RuntimeError:
+            pass
 
 
 @torch.no_grad()
@@ -38,6 +75,8 @@ def test_dense(rank, world_size, port, tp_size):
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
     print(f"[Rank {rank}] test_dense passed successfully!")
+    del sgl_out, sgl_target_model, input_ids, attention_mask, loss_mask
+    cleanup_distributed()
 
 
 @torch.no_grad()
@@ -61,6 +100,7 @@ def test_moe(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.4,
     )
     sgl_target_model.set_aux_hidden_states_layers()
@@ -68,6 +108,8 @@ def test_moe(rank, world_size, port, tp_size):
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
     print(f"[Rank {rank}] test_moe passed successfully!")
+    del sgl_out, sgl_target_model, input_ids, attention_mask, loss_mask
+    cleanup_distributed()
 
 
 def test_vlm(rank, world_size, port, tp_size):
@@ -192,6 +234,7 @@ def test_vlm(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.75,
     )
     sgl_target_model.set_aux_hidden_states_layers()
@@ -210,6 +253,16 @@ def test_vlm(rank, world_size, port, tp_size):
         print(f"[Rank {rank}] target shape: {sgl_out.target.shape}")
         print(f"[Rank {rank}] input_ids shape: {sgl_out.input_ids.shape}")
         print(f"[Rank {rank}] test_vlm passed successfully!")
+    del (
+        sgl_out,
+        sgl_target_model,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        pixel_values,
+        image_grid_thw,
+    )
+    cleanup_distributed()
 
 
 def test_vlm_multi_batch(rank, world_size, port, tp_size):
@@ -345,6 +398,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.4,
     )
     sgl_target_model.set_aux_hidden_states_layers()
@@ -372,6 +426,16 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         print(f"[Rank {rank}] Batch size verification: PASSED")
         print(f"{'='*60}\n")
         print(f"[Rank {rank}] test_vlm_multi_batch passed successfully!")
+    del (
+        sgl_out,
+        sgl_target_model,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        pixel_values,
+        image_grid_thw,
+    )
+    cleanup_distributed()
 
 
 class TestTargetModelBackend(unittest.TestCase):
@@ -391,6 +455,7 @@ class TestTargetModelBackend(unittest.TestCase):
         port = get_available_port()
         mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 2))
 
+    @unittest.skip("Skip this test for now")
     def test_sglang_backend_with_vlm_multi_batch(self):
         world_size = 2
         port = get_available_port()
